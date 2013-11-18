@@ -4,11 +4,12 @@
 //           http://www.boost.org/LICENSE_1_0.txt)
 
 #if defined(_MSC_VER)
-#include "stdafx.h"
 #include <Windows.h>
 typedef unsigned long long ulong;
 typedef unsigned int uint;
+#define PRIu64 "I64u"
 #endif
+
 #include <list>
 #include <atomic>
 #include <thread>
@@ -233,7 +234,8 @@ void write_thread(int index) {
 	Writer w(Ring);
 	wait_for_thread_start();
 	ulong success = 0;
-	for(ulong count = 0; count < Total/WriteThreadCount+1; ++count) {
+	ulong total = Total/WriteThreadCount+1;
+	for(ulong count = 0; count < total; ++count) {
 		w.write();
 		++success;
 	}
