@@ -1,0 +1,3 @@
+atomic_queue - this is a test program for a single reader single writer, 400 million ops/sec for baseline
+win          - these are the solution files for visual studio, unusable as it compiles atomic<>.load() into cmpxchg8...
+
