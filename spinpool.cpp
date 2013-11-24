@@ -69,6 +69,15 @@ ulong get_index(ulong position) {
 		((position & CacheLineSizeMask) >> (RingBits-CacheLineSizeBits));
 }
 
+void try_set_affinity(int core_index) {
+#if defined(_MSC_VER)
+	//printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
+#endif
+    unsigned long mask = 1 << core_index;
+    if(pthread_setaffinity_np(pthread_self(), sizeof(mask), (cpu_set_t*)&mask) < 0)
+        printf("setting affinity to %d failed\n", core_index);
+}
+
 class Reader {
 private:
 	char _padding1[64];
@@ -263,6 +272,7 @@ public:
 atomic<unsigned int> running_writers;
 
 void read_thread(int index) {
+    try_set_affinity(index+WriteThreadCount);
     vector<Reader> readers;
     for(unsigned int i=0; i<WriteThreadCount; ++i)
         readers.push_back(Reader(AllRings[i]));
@@ -284,9 +294,7 @@ void read_thread(int index) {
 }
 
 void write_thread(int index) {
-#if defined(_MSC_VER)
-	printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
-#endif
+    try_set_affinity(index);
 	SimpleWriter w(AllRings[index]);
 	wait_for_thread_start();
 	ulong success = 0;
@@ -301,9 +309,7 @@ void write_thread(int index) {
 }
 
 void read_write_thread(int index) {
-#if defined(_MSC_VER)
-	printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
-#endif
+    try_set_affinity(index+WriteThreadCount+ReadThreadCount);
 	Reader r(AllRings[index]);
 	Writer w(AllRings[index]);
 	wait_for_thread_start();
