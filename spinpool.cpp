@@ -11,6 +11,7 @@ typedef unsigned int uint;
 #endif
 
 #include <list>
+#include <vector>
 #include <atomic>
 #include <thread>
 #include <cassert>
@@ -39,16 +40,18 @@ unsigned int ReadThreadCount = 0;
 unsigned int WriteThreadCount = 0;
 unsigned int ReadWriteThreadCount = 0;
 unsigned int ProcessingTime = 0;
-const unsigned int RingBits = 20; // 1M
+const unsigned int RingBits = 10; // 1M
 const ulong RingSize = ((ulong)1) << RingBits;
 const ulong RingMask = RingSize-1;
 ulong Total = 0;
-volatile ulong Ring[RingSize] = {};
 const unsigned int CacheLineSizeBits = 3; // 2**3 * 8 byte = 64 byte
 const ulong CacheLineSizeMask = ((((ulong)1) << CacheLineSizeBits)-1) << (RingBits-CacheLineSizeBits);
 
 atomic<bool> thread_start_sync(false);
 atomic<ulong> total_writes;
+
+const unsigned int MaxRingCount = 32;
+volatile ulong AllRings[MaxRingCount][RingSize] = {};
 
 void wait_for_thread_start() {
 	while(!thread_start_sync)
@@ -110,8 +113,7 @@ public:
 
 			if(value < expected_full) {
 				++retry1;
-				_mm_pause();
-				continue;
+				return -1;
 			}
 
 			if(value == expected_full) {
@@ -213,25 +215,79 @@ public:
 	}
 };
 
-void read_thread() {
-	Reader r(Ring);
+class SimpleWriter {
+private:
+	char _padding1[64];
+	ulong _position;
+	volatile ulong *_ring;
+
+	ulong get_index() {
+		return ::get_index(_position);
+	}
+
+	static ulong get_expected_empty(ulong position) {
+		return (position >> (RingBits-1)) & ~(ulong)1;
+	}
+
+	ulong get_expected_empty() {
+		return get_expected_empty(_position);
+	}
+
+public:
+	ulong retry1;
+	ulong retry2;
+	ulong multiskip;
+	char _padding2[64];
+
+	SimpleWriter(volatile ulong *ring) {
+		_position = 2*RingSize;
+		_ring = ring;
+		retry1 = 0;
+		retry2 = 0;
+		multiskip = 0;
+	}
+
+	void write() {
+		ulong index = get_index();
+		//_m_prefetch(((char*)&_ring[index])+64);
+		ulong expected_empty = get_expected_empty();
+		
+		while(_ring[index] != expected_empty)
+		    _mm_pause();
+		_ring[index] = expected_empty+1;
+
+		++_position;
+	}
+};
+
+atomic<unsigned int> running_writers;
+
+void read_thread(int index) {
+    vector<Reader> readers;
+    for(unsigned int i=0; i<WriteThreadCount; ++i)
+        readers.push_back(Reader(AllRings[i]));
 	ulong success = 0;
 	wait_for_thread_start();
-	while(true) {
-		ulong value = r.read();
-		if(value == ((Total >> (RingBits-1)) | 1)+4)
-			break;
-		++success;
-		wait_pause(ProcessingTime);
+	while(running_writers.load(memory_order_relaxed) != 0) {
+        for(unsigned int i=0; i<WriteThreadCount; ++i) {
+            ulong value = readers[i].read();
+            if(value != (ulong)-1) {
+		        ++success;
+		        wait_pause(ProcessingTime);
+            }
+		}
 	}
-	printf("Read: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", success/1000000.0, success, r.retry1/1000000.0, r.retry2/1000000.0, r.multiskip);
+    for(unsigned int i=0; i<WriteThreadCount; ++i) {
+        Reader &r = readers[i];
+    	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, success/1000000.0, success, r.retry1/1000000.0, r.retry2/1000000.0, r.multiskip);
+    }
 }
 
 void write_thread(int index) {
 #if defined(_MSC_VER)
 	printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
 #endif
-	Writer w(Ring);
+	SimpleWriter w(AllRings[index]);
 	wait_for_thread_start();
 	ulong success = 0;
 	ulong total = Total/WriteThreadCount+1;
@@ -239,6 +295,7 @@ void write_thread(int index) {
 		w.write();
 		++success;
 	}
+	--running_writers;
 	printf("Written: %.3f (%" PRIu64 ") Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", success/1000000.0, success, w.retry1/1000000.0, w.retry2/1000000.0, w.multiskip);
 	total_writes += success;
 }
@@ -247,8 +304,8 @@ void read_write_thread(int index) {
 #if defined(_MSC_VER)
 	printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
 #endif
-	Reader r(Ring);
-	Writer w(Ring);
+	Reader r(AllRings[index]);
+	Writer w(AllRings[index]);
 	wait_for_thread_start();
 	ulong read_success = 0;
 	ulong write_success = 0;
@@ -285,13 +342,16 @@ int main(int argc, char* argv[])
 	ReadWriteThreadCount = atoi(argv[4]);
 	ProcessingTime = atoi(argv[5]);
 
-	for(unsigned int i=0; i<RingSize; ++i) {
-		Ring[i] = 4; // starting with 0 causes the asserts to fail because of the underflow of unsigned values
+	for(unsigned int j=0; j<MaxRingCount; ++j) {
+	    for(unsigned int i=0; i<RingSize; ++i) {
+		    AllRings[j][i] = 4; // starting with 0 causes the asserts to fail because of the underflow of unsigned values
+	    }
 	}
 	printf("starting with %" PRIu64 " ops, read: %d, write: %d, read/write: %d, pause loops: %d\n", Total, ReadThreadCount, WriteThreadCount, ReadWriteThreadCount, ProcessingTime);
 	list<thread> threads;
+	running_writers = WriteThreadCount;
 	for(unsigned int i=0; i<ReadThreadCount; ++i) {
-		threads.push_back(thread(read_thread));
+		threads.push_back(thread([=]{ read_thread(i); }));
 	}
 	for(unsigned int i=0; i<WriteThreadCount; ++i) {
 		threads.push_back(thread([=]{ write_thread(i); }));
