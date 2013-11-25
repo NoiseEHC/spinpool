@@ -12,25 +12,20 @@
 #include <atomic>
 #include <thread>
 #include <cassert>
+#include <chrono>
 
 #if defined(__GNUC__) || defined(__GNUG__)
 #include <xmmintrin.h>
 #include <stdio.h>
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
-#include <sys/time.h>
-int GetTickCount()
-{
-	struct timeval  tv;
-	gettimeofday(&tv, NULL);
-	return (tv.tv_sec) * 1000 + (tv.tv_usec / 1000) ;
-}
 #endif
 
 static_assert( sizeof(ulong) == 8, "64 bit needed" );
 static_assert( sizeof(uint) == 4, "32 bit needed" );
 
 using namespace std;
+using namespace std::chrono;
 
 unsigned int ReadThreadCount = 0;
 unsigned int WriteThreadCount = 0;
@@ -324,11 +319,12 @@ int main(int argc, char* argv[])
 	for(unsigned int i=0; i<ReadWriteThreadCount; ++i) {
 		threads.push_back(thread([=]{ read_write_thread(i); }));
 	}
-	auto start = GetTickCount();
+	auto start = steady_clock::now();
 	thread_start_sync = true;
 	for(thread &t : threads)
 		t.join();
-	auto elapsed = GetTickCount() - start;
-	printf("%" PRIu64 " write ops, %.3f million ops/sec\n", total_writes.load(), (double)total_writes.load() / (double)elapsed * 1000.0 / 1000000.0);
+	auto end = steady_clock::now();
+    auto elapsed = duration_cast<milliseconds>(end - start);
+	printf("%" PRIu64 " write ops, %.3f million ops/sec\n", total_writes.load(), (double)total_writes.load() / (double)elapsed.count() * 1000.0 / 1000000.0);
 	return 0;
 }
