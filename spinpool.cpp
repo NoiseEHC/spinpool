@@ -4,10 +4,7 @@
 //           http://www.boost.org/LICENSE_1_0.txt)
 
 #if defined(_MSC_VER)
-#include <Windows.h>
-typedef unsigned long long ulong;
-typedef unsigned int uint;
-#define PRIu64 "I64u"
+#error "Both VS 2012/2013 compile lock cmpxchg8 for atomic<T>.load(), do not use them!!!"
 #endif
 
 #include <list>
@@ -21,7 +18,6 @@ typedef unsigned int uint;
 #include <stdio.h>
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
-#define _InterlockedCompareExchange64(p,n,o) __sync_val_compare_and_swap(p,o,n)
 #include <sys/time.h>
 int GetTickCount()
 {
@@ -51,7 +47,8 @@ atomic<bool> thread_start_sync(false);
 atomic<ulong> total_writes;
 
 const unsigned int MaxRingCount = 32;
-volatile ulong AllRings[MaxRingCount][RingSize] = {};
+//vector< vector< atomic<ulong> > > AllRings;
+atomic<ulong> AllRings[MaxRingCount][RingSize];
 
 void wait_for_thread_start() {
 	while(!thread_start_sync)
@@ -70,6 +67,7 @@ ulong get_index(ulong position) {
 }
 
 void try_set_affinity(int core_index) {
+    return;
 #if defined(_MSC_VER)
 	//printf("Old affinity for %d: %d\n", index, SetThreadAffinityMask(GetCurrentThread(), 1<<index));
 #endif
@@ -82,7 +80,7 @@ class Reader {
 private:
 	char _padding1[64];
 	ulong _position;
-	volatile ulong *_ring;
+	atomic<ulong> *_ring;
 
 	ulong get_index() {
 		return ::get_index(_position);
@@ -102,7 +100,7 @@ public:
 	ulong multiskip;
 	char _padding2[64];
 
-	Reader(volatile ulong *ring) {
+	Reader(atomic<ulong> *ring) {
 		_position = 2*RingSize;
 		_ring = ring;
 		retry1 = 0;
@@ -116,7 +114,7 @@ public:
 			//_m_prefetch(((char*)&_ring[index])+64);
 			ulong expected_full = get_expected_full();
 
-			ulong value = _ring[index];
+			ulong value = _ring[index].load(memory_order_relaxed);
 		try_again:
 			assert(value >= expected_full-2);
 
@@ -126,8 +124,8 @@ public:
 			}
 
 			if(value == expected_full) {
-				value = _InterlockedCompareExchange64((volatile long long *)&_ring[index], value+1, expected_full);
-				if(value == expected_full) {
+			    //TOOD: it is a little bit slower than using intrinsics (on x64 gcc at least)
+			    if(_ring[index].compare_exchange_weak(value, value+1, memory_order_acquire, memory_order_relaxed)) {
 					++_position;
 					return value;
 				}
@@ -135,11 +133,12 @@ public:
 				goto try_again;
 			} else { // skip or we are behind
 				ulong skip_size = 1;
+				//TODO: optimize case when we are behing with at least a round (different than skipping 1-32 items...)
 				while(true) {
 					ulong test_position = _position+skip_size*2;
 					index = ::get_index(test_position);
 					expected_full = get_expected_full(test_position);
-					if(_ring[index] < expected_full+2)
+					if(_ring[index].load(memory_order_relaxed) < expected_full+2)
 						break;
 					skip_size *= 2;
 					++multiskip;
@@ -154,7 +153,7 @@ class Writer {
 private:
 	char _padding1[64];
 	ulong _position;
-	volatile ulong *_ring;
+	atomic<ulong> *_ring;
 
 	ulong get_index() {
 		return ::get_index(_position);
@@ -174,81 +173,7 @@ public:
 	ulong multiskip;
 	char _padding2[64];
 
-	Writer(volatile ulong *ring) {
-		_position = 2*RingSize;
-		_ring = ring;
-		retry1 = 0;
-		retry2 = 0;
-		multiskip = 0;
-	}
-
-	void write() {
-		while(true) {
-			ulong index = get_index();
-			//_m_prefetch(((char*)&_ring[index])+64);
-			ulong expected_empty = get_expected_empty();
-
-			ulong value = _ring[index];
-		try_again:
-			assert(value >= expected_empty-1);
-
-			if(value < expected_empty) {
-				++retry1;
-				_mm_pause();
-				continue;
-			}
-
-			if(value == expected_empty) {
-				value = _InterlockedCompareExchange64((volatile long long *)&_ring[index], value+1, expected_empty);
-				if(value == expected_empty) {
-					//printf("W:%d ", index);
-					++_position;
-					return;
-				}
-				++retry2;
-				goto try_again;
-			} else { // skip or we are behind
-				ulong skip_size = 1;
-				while(true) {
-					ulong test_position = _position+skip_size*2;
-					index = ::get_index(test_position);
-					expected_empty = get_expected_empty(test_position);
-					if(_ring[index] < expected_empty+2)
-						break;
-					skip_size *= 2;
-					++multiskip;
-				}
-				_position += skip_size;
-			}
-		}
-	}
-};
-
-class SimpleWriter {
-private:
-	char _padding1[64];
-	ulong _position;
-	volatile ulong *_ring;
-
-	ulong get_index() {
-		return ::get_index(_position);
-	}
-
-	static ulong get_expected_empty(ulong position) {
-		return (position >> (RingBits-1)) & ~(ulong)1;
-	}
-
-	ulong get_expected_empty() {
-		return get_expected_empty(_position);
-	}
-
-public:
-	ulong retry1;
-	ulong retry2;
-	ulong multiskip;
-	char _padding2[64];
-
-	SimpleWriter(volatile ulong *ring) {
+	Writer(atomic<ulong> *ring) {
 		_position = 2*RingSize;
 		_ring = ring;
 		retry1 = 0;
@@ -261,11 +186,31 @@ public:
 		//_m_prefetch(((char*)&_ring[index])+64);
 		ulong expected_empty = get_expected_empty();
 		
-		while(_ring[index] != expected_empty)
+		while(_ring[index].load(memory_order_relaxed) != expected_empty)
 		    _mm_pause();
-		_ring[index] = expected_empty+1;
+		_ring[index].store(expected_empty+1, memory_order_release);
 
 		++_position;
+	}
+};
+
+class MultiReader {
+public:
+    vector<Reader> readers;
+    
+    MultiReader(uint preferred_writer, uint writer_count) {
+        //TODO: first loop through our cpu socket then the other sockets
+        for(uint i=0; i<writer_count; ++i)
+            readers.push_back(Reader(AllRings[(i+preferred_writer) % writer_count]));
+    }
+
+	ulong read() {
+        for(auto& r : readers) {
+            ulong value = r.read();
+            if(value != (ulong)-1)
+                return value;
+        }
+        return -1;
 	}
 };
 
@@ -273,29 +218,27 @@ atomic<unsigned int> running_writers;
 
 void read_thread(int index) {
     try_set_affinity(index+WriteThreadCount);
-    vector<Reader> readers;
-    for(unsigned int i=0; i<WriteThreadCount; ++i)
-        readers.push_back(Reader(AllRings[i]));
+    MultiReader mr(index, WriteThreadCount);
 	ulong success = 0;
 	wait_for_thread_start();
 	while(running_writers.load(memory_order_relaxed) != 0) {
-        for(unsigned int i=0; i<WriteThreadCount; ++i) {
-            ulong value = readers[i].read();
-            if(value != (ulong)-1) {
-		        ++success;
-		        wait_pause(ProcessingTime);
-            }
-		}
+        ulong value = mr.read();
+        if(value != (ulong)-1) {
+	        ++success;
+	        wait_pause(ProcessingTime);
+        } else {
+            _mm_pause();
+        }
 	}
     for(unsigned int i=0; i<WriteThreadCount; ++i) {
-        Reader &r = readers[i];
+        auto &r = mr.readers[i];
     	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, success/1000000.0, success, r.retry1/1000000.0, r.retry2/1000000.0, r.multiskip);
     }
 }
 
 void write_thread(int index) {
     try_set_affinity(index);
-	SimpleWriter w(AllRings[index]);
+	Writer w(AllRings[index]);
 	wait_for_thread_start();
 	ulong success = 0;
 	ulong total = Total/WriteThreadCount+1;
