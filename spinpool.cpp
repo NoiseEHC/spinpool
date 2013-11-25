@@ -31,15 +31,21 @@ unsigned int ReadThreadCount = 0;
 unsigned int WriteThreadCount = 0;
 unsigned int ReadWriteThreadCount = 0;
 unsigned int ProcessingTime = 0;
-const unsigned int RingBits = 10; // 1M
+ulong Total = 0;
+
+const unsigned int RingBits = 20; // 1M
 const ulong RingSize = ((ulong)1) << RingBits;
 const ulong RingMask = RingSize-1;
-ulong Total = 0;
 const unsigned int CacheLineSizeBits = 3; // 2**3 * 8 byte = 64 byte
 const ulong CacheLineSizeMask = ((((ulong)1) << CacheLineSizeBits)-1) << (RingBits-CacheLineSizeBits);
+const uint PayloadBits = 21; // 2M
+const uint PayloadShift = sizeof(ulong)*8 - PayloadBits;
+const ulong PayloadMask = ~(((ulong)1 << PayloadShift)-1);
 
 atomic<bool> thread_start_sync(false);
 atomic<ulong> total_writes;
+atomic<ulong> total_reads;
+atomic<ulong> running_writes;
 
 const unsigned int MaxRingCount = 32;
 //vector< vector< atomic<ulong> > > AllRings;
@@ -112,18 +118,19 @@ public:
 
 			ulong value = _ring[index].load(memory_order_relaxed);
 		try_again:
-			assert(value >= expected_full-2);
+		    ulong counter_value = value & ~PayloadMask;
+			assert(counter_value >= expected_full-2);
 
-			if(value < expected_full) {
+			if(counter_value < expected_full) {
 				++retry1;
 				return nothing_to_read;
 			}
 
-			if(value == expected_full) {
+			if(counter_value == expected_full) {
 			    //TOOD: it is a little bit slower than using intrinsics (on x64 gcc at least)
-			    if(_ring[index].compare_exchange_weak(value, value+1, memory_order_acquire, memory_order_relaxed)) {
+			    if(_ring[index].compare_exchange_weak(value, counter_value+1, memory_order_acquire, memory_order_relaxed)) {
 					++_position;
-					return value;
+					return value >> PayloadShift;
 				}
 				++retry2;
 				goto try_again;
@@ -134,7 +141,9 @@ public:
 					ulong test_position = _position+skip_size*2;
 					index = ::get_index(test_position);
 					expected_full = get_expected_full(test_position);
-					if(_ring[index].load(memory_order_relaxed) < expected_full+2)
+					value = _ring[index].load(memory_order_relaxed);
+        		    counter_value = value & ~PayloadMask;
+					if(counter_value < expected_full+2)
 						break;
 					skip_size *= 2;
 					++multiskip;
@@ -173,7 +182,7 @@ public:
 		retry1 = 0;
 	}
 
-	void write() {
+	void write(ulong payload) {
 		ulong index = get_index();
 		//_m_prefetch(((char*)&_ring[index])+64);
 		ulong expected_empty = get_expected_empty();
@@ -182,7 +191,8 @@ public:
 		    ++retry1;
 		    _mm_pause();
 		}
-		_ring[index].store(expected_empty+1, memory_order_release);
+		ulong value = payload << PayloadShift | (expected_empty+1);
+		_ring[index].store(value, memory_order_release);
 
 		++_position;
 	}
@@ -228,15 +238,18 @@ public:
 	}
 };
 
-atomic<unsigned int> running_writers;
-
 void read_thread(int index) {
     try_set_affinity(index+WriteThreadCount);
     MultiReader mr(index, WriteThreadCount);
 	wait_for_thread_start();
-	while(running_writers.load(memory_order_relaxed) != 0) {
+	while(true) {
         ulong value = mr.read();
         if(value != MultiReader::nothing_to_read) {
+            if(value == 1000000)
+                break;
+            if(value != 1) {
+                printf("read value: %u\n", (uint)value);
+            }
 	        wait_pause(ProcessingTime);
         } else {
             _mm_pause();
@@ -245,6 +258,7 @@ void read_thread(int index) {
 	uint i=0;
     for(auto &r : mr.readers) {
     	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, r.count/1000000.0, r.count, r.reader.retry1/1000000.0, r.reader.retry2/1000000.0, r.reader.multiskip);
+        total_reads += r.count;
     	++i;
     }
 }
@@ -254,12 +268,15 @@ void write_thread(int index) {
 	Writer w(AllRings[index]);
 	wait_for_thread_start();
 	ulong success = 0;
-	ulong total = Total/WriteThreadCount+1;
+	ulong total = Total/WriteThreadCount;
 	for(ulong count = 0; count < total; ++count) {
-		w.write();
+		w.write(1);
 		++success;
 	}
-	--running_writers;
+    if(--running_writes == 0) {
+	    for(uint i=0; i<ReadThreadCount; ++i)
+        	w.write(1000000);
+    }
 	printf("Written: %.3f (%" PRIu64 ") Retry: %.3f\n", success/1000000.0, success, w.retry1/1000000.0);
 	total_writes += success;
 }
@@ -274,7 +291,7 @@ void read_write_thread(int index) {
 	ulong total = Total/ReadWriteThreadCount/10;
 	for(ulong count = 0; count < total; ++count) {
 	    for(uint i=0; i<10; ++i) {
-		    w.write(); ++write_success;
+		    w.write(count); ++write_success;
 		}
 	    for(uint i=0; i<10; ++i) {
     		mr.blocking_read();
@@ -309,7 +326,7 @@ int main(int argc, char* argv[])
 	}
 	printf("starting with %" PRIu64 " ops, read: %d, write: %d, read/write: %d, pause loops: %d\n", Total, ReadThreadCount, WriteThreadCount, ReadWriteThreadCount, ProcessingTime);
 	list<thread> threads;
-	running_writers = WriteThreadCount;
+	running_writes = WriteThreadCount;
 	for(unsigned int i=0; i<ReadThreadCount; ++i) {
 		threads.push_back(thread([=]{ read_thread(i); }));
 	}
@@ -325,6 +342,6 @@ int main(int argc, char* argv[])
 		t.join();
 	auto end = steady_clock::now();
     auto elapsed = duration_cast<milliseconds>(end - start);
-	printf("%" PRIu64 " write ops, %.3f million ops/sec\n", total_writes.load(), (double)total_writes.load() / (double)elapsed.count() * 1000.0 / 1000000.0);
+	printf("%" PRIu64 " write ops, %" PRIu64 " read ops, %.3f million queue ops/sec\n", total_writes.load(), total_reads.load(), (double)total_writes.load() / (double)elapsed.count() * 1000.0 / 1000000.0);
 	return 0;
 }
