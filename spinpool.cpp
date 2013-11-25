@@ -95,6 +95,7 @@ private:
 	}
 
 public:
+    static const ulong nothing_to_read = -1;
 	ulong retry1;
 	ulong retry2;
 	ulong multiskip;
@@ -120,7 +121,7 @@ public:
 
 			if(value < expected_full) {
 				++retry1;
-				return -1;
+				return nothing_to_read;
 			}
 
 			if(value == expected_full) {
@@ -169,16 +170,12 @@ private:
 
 public:
 	ulong retry1;
-	ulong retry2;
-	ulong multiskip;
 	char _padding2[64];
 
 	Writer(atomic<ulong> *ring) {
 		_position = 2*RingSize;
 		_ring = ring;
 		retry1 = 0;
-		retry2 = 0;
-		multiskip = 0;
 	}
 
 	void write() {
@@ -186,8 +183,10 @@ public:
 		//_m_prefetch(((char*)&_ring[index])+64);
 		ulong expected_empty = get_expected_empty();
 		
-		while(_ring[index].load(memory_order_relaxed) != expected_empty)
+		while(_ring[index].load(memory_order_relaxed) != expected_empty) {
+		    ++retry1;
 		    _mm_pause();
+		}
 		_ring[index].store(expected_empty+1, memory_order_release);
 
 		++_position;
@@ -196,21 +195,41 @@ public:
 
 class MultiReader {
 public:
-    vector<Reader> readers;
+    static const ulong nothing_to_read = Reader::nothing_to_read;
+    
+    struct ReaderWithCount {
+        Reader reader;
+        ulong count;
+        
+        ReaderWithCount(Reader reader, ulong count) : reader(reader), count(count) {}
+    };
+    
+    vector<ReaderWithCount> readers;
     
     MultiReader(uint preferred_writer, uint writer_count) {
         //TODO: first loop through our cpu socket then the other sockets
         for(uint i=0; i<writer_count; ++i)
-            readers.push_back(Reader(AllRings[(i+preferred_writer) % writer_count]));
+            readers.push_back(ReaderWithCount(Reader(AllRings[(i+preferred_writer) % writer_count]),0));
     }
 
 	ulong read() {
         for(auto& r : readers) {
-            ulong value = r.read();
-            if(value != (ulong)-1)
+            ulong value = r.reader.read();
+            if(value != nothing_to_read) {
+                ++r.count;
                 return value;
+            }
         }
-        return -1;
+        return nothing_to_read;
+	}
+
+	ulong blocking_read() {
+	    while(true) {
+	        ulong value = read();
+            if(value != nothing_to_read)
+                return value;
+            _mm_pause();
+	    }
 	}
 };
 
@@ -219,20 +238,19 @@ atomic<unsigned int> running_writers;
 void read_thread(int index) {
     try_set_affinity(index+WriteThreadCount);
     MultiReader mr(index, WriteThreadCount);
-	ulong success = 0;
 	wait_for_thread_start();
 	while(running_writers.load(memory_order_relaxed) != 0) {
         ulong value = mr.read();
-        if(value != (ulong)-1) {
-	        ++success;
+        if(value != MultiReader::nothing_to_read) {
 	        wait_pause(ProcessingTime);
         } else {
             _mm_pause();
         }
 	}
-    for(unsigned int i=0; i<WriteThreadCount; ++i) {
-        auto &r = mr.readers[i];
-    	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, success/1000000.0, success, r.retry1/1000000.0, r.retry2/1000000.0, r.multiskip);
+	uint i=0;
+    for(auto &r : mr.readers) {
+    	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, r.count/1000000.0, r.count, r.reader.retry1/1000000.0, r.reader.retry2/1000000.0, r.reader.multiskip);
+    	++i;
     }
 }
 
@@ -247,35 +265,33 @@ void write_thread(int index) {
 		++success;
 	}
 	--running_writers;
-	printf("Written: %.3f (%" PRIu64 ") Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", success/1000000.0, success, w.retry1/1000000.0, w.retry2/1000000.0, w.multiskip);
+	printf("Written: %.3f (%" PRIu64 ") Retry: %.3f\n", success/1000000.0, success, w.retry1/1000000.0);
 	total_writes += success;
 }
 
 void read_write_thread(int index) {
-    try_set_affinity(index+WriteThreadCount+ReadThreadCount);
-	Reader r(AllRings[index]);
+    // there is better to be no readers and writers!!!
+    try_set_affinity(index);
+    MultiReader mr(index, ReadWriteThreadCount);
 	Writer w(AllRings[index]);
 	wait_for_thread_start();
-	ulong read_success = 0;
 	ulong write_success = 0;
-	for(int i=0; i<1; ++i) // readers and writers are separated by as many items (must be at least 1 !!!)
-		w.write();
-	ulong total = Total*2/3/ReadWriteThreadCount;
+	ulong total = Total/ReadWriteThreadCount/10;
 	for(ulong count = 0; count < total; ++count) {
-		//printf("%d %d\n", index, count);
-		if(count & 1) {
-			r.read(); ++read_success;
-			r.read(); ++read_success;
-			w.write(); ++write_success;
-		} else {
-			r.read(); ++read_success;
-			w.write(); ++write_success;
-			w.write(); ++write_success;
+	    for(uint i=0; i<10; ++i) {
+		    w.write(); ++write_success;
 		}
-		wait_pause(ProcessingTime);
+	    for(uint i=0; i<10; ++i) {
+    		mr.blocking_read();
+    		wait_pause(ProcessingTime);
+    	}
 	}
-	printf("%d Read   : %.3f (%" PRIu64 ") Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, read_success/1000000.0, read_success, r.retry1/1000000.0, r.retry2/1000000.0, r.multiskip);
-	printf("%d Written: %.3f (%" PRIu64 ") Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, write_success/1000000.0, write_success, w.retry1/1000000.0, w.retry2/1000000.0, w.multiskip);
+	uint i=0;
+    for(auto &r : mr.readers) {
+    	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, r.count/1000000.0, r.count, r.reader.retry1/1000000.0, r.reader.retry2/1000000.0, r.reader.multiskip);
+    	++i;
+    }
+	printf("Written %d: %.3f (%" PRIu64 ") Retry: %.3f\n", index, write_success/1000000.0, write_success, w.retry1/1000000.0);
 	total_writes += write_success;
 }
 
