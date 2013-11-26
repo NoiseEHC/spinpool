@@ -19,6 +19,12 @@
 #include <stdio.h>
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
+static __inline__ unsigned long long rdtsc(void)
+{
+    unsigned hi, lo;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+}
 #endif
 
 static_assert( sizeof(ulong) == 8, "64 bit needed" );
@@ -83,16 +89,8 @@ private:
 	ulong _position;
 	atomic<ulong> *_ring;
 
-	ulong get_index() {
-		return ::get_index(_position);
-	}
-
 	static ulong get_expected_full(ulong position) {
 		return (position >> (RingBits-1)) | 1;
-	}
-
-	ulong get_expected_full() {
-		return get_expected_full(_position);
 	}
 
 public:
@@ -112,9 +110,9 @@ public:
 
 	ulong read() {
 		while(true) {
-			ulong index = get_index();
+			ulong index = get_index(_position);
 			//_m_prefetch(((char*)&_ring[index])+64);
-			ulong expected_full = get_expected_full();
+			ulong expected_full = get_expected_full(_position);
 
 			ulong value = _ring[index].load(memory_order_relaxed);
 		try_again:
@@ -160,16 +158,8 @@ private:
 	ulong _position;
 	atomic<ulong> *_ring;
 
-	ulong get_index() {
-		return ::get_index(_position);
-	}
-
 	static ulong get_expected_empty(ulong position) {
 		return (position >> (RingBits-1)) & ~(ulong)1;
-	}
-
-	ulong get_expected_empty() {
-		return get_expected_empty(_position);
 	}
 
 public:
@@ -183,9 +173,9 @@ public:
 	}
 
 	void write(ulong payload) {
-		ulong index = get_index();
+		ulong index = get_index(_position);
 		//_m_prefetch(((char*)&_ring[index])+64);
-		ulong expected_empty = get_expected_empty();
+		ulong expected_empty = get_expected_empty(_position);
 		
 		while(_ring[index].load(memory_order_relaxed) != expected_empty) {
 		    ++retry1;
@@ -287,24 +277,46 @@ void read_write_thread(int index) {
     MultiReader mr(index, ReadWriteThreadCount);
 	Writer w(AllRings[index]);
 	wait_for_thread_start();
-	ulong write_success = 0;
-	ulong total = Total/ReadWriteThreadCount/10;
-	for(ulong count = 0; count < total; ++count) {
-	    for(uint i=0; i<10; ++i) {
-		    w.write(count); ++write_success;
-		}
-	    for(uint i=0; i<10; ++i) {
-    		mr.blocking_read();
-    		wait_pause(ProcessingTime);
-    	}
+	uint multiplier = 2;
+	if(index == 0) {
+    	/*ulong total = Total;
+	    for(ulong i=0; i<total; ++i) {
+       		wait_pause(ProcessingTime); // 20 means 5 million/sec on my laptop
+	    }
+        total_writes += total;
+	    return;*/
+    	ulong total = Total/multiplier;
+    	ulong write_success=0;
+        while(write_success < total) {
+            w.write(1); ++write_success;
+       		wait_pause(ProcessingTime);
+	    }
+       	total_writes += write_success;
+	    for(uint i=0; i<ReadWriteThreadCount; ++i)
+        	w.write(1000000);
+    	printf("Written %d: %.3f (%" PRIu64 ") Retry: %.3f\n", index, write_success/1000000.0, write_success, w.retry1/1000000.0);
+	} else {
+	    ulong write_success = 0;
+	    while(true) {
+       		ulong value = mr.blocking_read();
+       		if(value == 1000000)
+       		    break;
+       		if(value == 1) {
+	            for(uint i=0; i<multiplier; ++i) {
+		            w.write(2); ++write_success;
+		        }
+		    } // else swallow the value 2*/
+       		//wait_pause(ProcessingTime);
+	    }
+	    uint i=0;
+        for(auto &r : mr.readers) {
+        	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, r.count/1000000.0, r.count, r.reader.retry1/1000000.0, r.reader.retry2/1000000.0, r.reader.multiskip);
+            total_reads += r.count;
+        	++i;
+        }
+	    printf("Written %d: %.3f (%" PRIu64 ") Retry: %.3f\n", index, write_success/1000000.0, write_success, w.retry1/1000000.0);
+	    total_writes += write_success;
 	}
-	uint i=0;
-    for(auto &r : mr.readers) {
-    	printf("Read %d/%d: %.3f (%" PRIu64 "), Retry: %.3f %.3f, Multiskip: %" PRIu64 "\n", index, i, r.count/1000000.0, r.count, r.reader.retry1/1000000.0, r.reader.retry2/1000000.0, r.reader.multiskip);
-    	++i;
-    }
-	printf("Written %d: %.3f (%" PRIu64 ") Retry: %.3f\n", index, write_success/1000000.0, write_success, w.retry1/1000000.0);
-	total_writes += write_success;
 }
 
 int main(int argc, char* argv[])
