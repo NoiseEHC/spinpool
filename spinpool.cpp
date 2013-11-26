@@ -27,6 +27,8 @@ static __inline__ unsigned long long rdtsc(void)
 }
 #endif
 
+#include "spinallocator.hpp"
+
 static_assert( sizeof(ulong) == 8, "64 bit needed" );
 static_assert( sizeof(uint) == 4, "32 bit needed" );
 
@@ -44,9 +46,16 @@ const ulong RingSize = ((ulong)1) << RingBits;
 const ulong RingMask = RingSize-1;
 const unsigned int CacheLineSizeBits = 3; // 2**3 * 8 byte = 64 byte
 const ulong CacheLineSizeMask = ((((ulong)1) << CacheLineSizeBits)-1) << (RingBits-CacheLineSizeBits);
-const uint PayloadBits = 21; // 2M
+const uint PayloadBits = 10; // 1K
 const uint PayloadShift = sizeof(ulong)*8 - PayloadBits;
 const ulong PayloadMask = ~(((ulong)1 << PayloadShift)-1);
+
+const uint PayloadCount = (uint)1 << PayloadBits;
+const ulong ExitPayload = PayloadCount-1;
+const uint AllocatorPageSize = 256;
+const uint AllocatorFullPageCount = PayloadCount/AllocatorPageSize;
+const uint AllocatorPageCount = AllocatorFullPageCount + 2*32; // assume max 32 threads
+const uint AllocatorUsablePageCount = AllocatorFullPageCount - 2*32; // assume max 32 threads
 
 atomic<bool> thread_start_sync(false);
 atomic<ulong> total_writes;
@@ -161,6 +170,8 @@ private:
 	static ulong get_expected_empty(ulong position) {
 		return (position >> (RingBits-1)) & ~(ulong)1;
 	}
+	
+	spinallocator<ulong,AllocatorPageSize> _allocator;
 
 public:
 	ulong retry1;
@@ -235,7 +246,7 @@ void read_thread(int index) {
 	while(true) {
         ulong value = mr.read();
         if(value != MultiReader::nothing_to_read) {
-            if(value == 1000000)
+            if(value == ExitPayload)
                 break;
             if(value != 1) {
                 printf("read value: %u\n", (uint)value);
@@ -265,7 +276,7 @@ void write_thread(int index) {
 	}
     if(--running_writes == 0) {
 	    for(uint i=0; i<ReadThreadCount; ++i)
-        	w.write(1000000);
+        	w.write(ExitPayload);
     }
 	printf("Written: %.3f (%" PRIu64 ") Retry: %.3f\n", success/1000000.0, success, w.retry1/1000000.0);
 	total_writes += success;
@@ -336,6 +347,21 @@ int main(int argc, char* argv[])
 		    AllRings[j][i] = 4; // starting with 0 causes the asserts to fail because of the underflow of unsigned values
 	    }
 	}
+	spinallocator<ulong,AllocatorPageSize>::init_empty_pages(AllocatorPageCount);
+	for(ulong i=0; i<AllocatorFullPageCount; ++i) {
+	    ulong start = i*AllocatorPageSize;
+	    array<ulong,AllocatorPageSize> items;
+	    for(uint j=0; j<AllocatorPageSize; ++j)
+	        items[j] = start+j;
+        spinallocator<ulong,AllocatorPageSize>::init_full_page(items);
+	}
+	spinallocator<ulong,AllocatorPageSize> alloc;
+	/*for(ulong i=0; i<AllocatorUsablePageCount*AllocatorPageSize; ++i) {
+	    ulong item = alloc.alloc();
+	    printf("%d ", (uint)item);
+	    assert(item == AllocatorFullPageCount*AllocatorPageSize-1-i);
+    }*/	    
+
 	printf("starting with %" PRIu64 " ops, read: %d, write: %d, read/write: %d, pause loops: %d\n", Total, ReadThreadCount, WriteThreadCount, ReadWriteThreadCount, ProcessingTime);
 	list<thread> threads;
 	running_writes = WriteThreadCount;
