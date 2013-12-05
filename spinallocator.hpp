@@ -5,74 +5,106 @@
 
 #include <array>
 #include <cassert>
+#include <atomic>
 #include <mutex>
 #include "spinlock.hpp"
 
 using namespace std;
 
-template<typename T, uint PageSize> 
+//typedef spinlock lock_type;
+typedef mutex lock_type;
+
+template<typename T, uint PageSize>
 class spinallocator {
 private:
-    
-    
+
     struct page {
         page *next; // nullptr terminated single list
         array<T,PageSize> items; // when in the full_list, always full, in empty_list always empty
-        
+
         page() : next(nullptr) {
         }
     };
-    
-    static page *full_list;
-    static page *empty_list;
-    static spinlock static_lock;
-    
+
+    class pagelist {
+    private:
+        page *head;
+        //uint count;
+
+//        void check_list_size() {
+//            page *item = head;
+//            uint cnt = 0;
+//            while(item != nullptr) {
+//                ++cnt;
+//                item = item->next;
+//            }
+//            assert(cnt == count);
+//        }
+
+    public:
+        pagelist() : head(nullptr) {
+        }
+
+        void insert(page *item) {
+            //check_list_size();
+            //++count;
+            assert(item->next == nullptr);
+            item->next = head;
+            head = item;
+            //check_list_size();
+        }
+
+        page *remove() {
+            //check_list_size();
+            //--count;
+            page *result = head;
+            if(result == nullptr) {
+                assert(result != nullptr);
+            }
+            head = result->next;
+            result->next = nullptr;
+            //check_list_size();
+            return result;
+        }
+    };
+
+    static pagelist full_list;
+    static pagelist empty_list;
+    static lock_type static_lock;
+
     page *_low;
     page *_high;
     uint _full_count; // starts from 0 in _low, owerflows to _high (until reaches 2*PageSize)
-    
-    static void insert_into_list(page* &list, page *item) {
-        assert(item->next == nullptr);
-        item->next = list;
-        list = item;
-    }
-    
-    static page *remove_from_list(page* &list) {
-        page *result = list;
-        assert(result != nullptr);
-        list = result->next;
-        result->next = nullptr;
-        return result;
-    }
 
 public:
     static void init_empty_pages(uint page_count) {
-        lock_guard<spinlock> lock(static_lock);
-        for(uint i=0; i<page_count; ++i)
-            insert_into_list(empty_list, new page());
+        lock_guard<lock_type> lock(static_lock);
+        for(uint i=0; i<page_count; ++i) {
+            empty_list.insert(new page());
+        }
     }
-    
+
     static void init_full_page(const array<T,PageSize> &new_items) {
-        lock_guard<spinlock> lock(static_lock);
-        page *new_page = remove_from_list(empty_list);
+        lock_guard<lock_type> lock(static_lock);
+        page *new_page = empty_list.remove();
         new_page->items = new_items;
-        insert_into_list(full_list, new_page);
+        full_list.insert(new_page);
     }
-    
+
     spinallocator() : _low(nullptr), _high(nullptr), _full_count(0) {
-        lock_guard<spinlock> lock(static_lock);
-        _low = remove_from_list(full_list);
-        _high = remove_from_list(empty_list);
+        lock_guard<lock_type> lock(static_lock);
+        _low = full_list.remove();
+        _high = empty_list.remove();
         _full_count = PageSize;
     }
-    
+
     //TODO: in the desctructor we cannot free _low and _high back into free/empty_list as they can be partially filled...
-    
+
     T alloc() {
         if(_full_count == 0) {
-            lock_guard<spinlock> lock(static_lock);
-            insert_into_list(empty_list, _low);
-            _low = remove_from_list(full_list);
+            lock_guard<lock_type> lock(static_lock);
+            empty_list.insert(_low);
+            _low = full_list.remove();
             _full_count = PageSize;
         }
         --_full_count;
@@ -82,13 +114,13 @@ public:
             return _high->items[_full_count-PageSize];
         }
     }
-    
+
     void free(T value) {
         assert(_full_count <= 2*PageSize);
         if(_full_count >= 2*PageSize) {
-            lock_guard<spinlock> lock(static_lock);
-            insert_into_list(full_list, _high);
-            _high = remove_from_list(empty_list);
+            lock_guard<lock_type> lock(static_lock);
+            full_list.insert(_high);
+            _high = empty_list.remove();
             _full_count = PageSize;
         }
         if(_full_count < PageSize) {
@@ -100,10 +132,9 @@ public:
     }
 };
 
-template<typename T, uint PageSize> 
-typename spinallocator<T, PageSize>::page *spinallocator<T, PageSize>::full_list = nullptr;
-template<typename T, uint PageSize> 
-typename spinallocator<T, PageSize>::page *spinallocator<T, PageSize>::empty_list = nullptr;
-template<typename T, uint PageSize> 
-spinlock spinallocator<T, PageSize>::static_lock;
-
+template<typename T, uint PageSize>
+typename spinallocator<T, PageSize>::pagelist spinallocator<T, PageSize>::full_list;
+template<typename T, uint PageSize>
+typename spinallocator<T, PageSize>::pagelist spinallocator<T, PageSize>::empty_list;
+template<typename T, uint PageSize>
+lock_type spinallocator<T, PageSize>::static_lock;
