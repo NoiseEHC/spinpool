@@ -20,7 +20,8 @@ public:
     }
     
     void lock() {
-        while(!_taken.test_and_set(memory_order_acquire))
+		//ARGH: test_and_set returns the last value
+        while(_taken.test_and_set(memory_order_acquire) == true)
             _mm_pause();
     }
 
